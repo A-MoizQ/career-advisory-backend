@@ -52,7 +52,6 @@ def _load_text_from_env_or_file(env_name: str,
     return default
 
 # Load main markdown prompt from env, fallback to the simple default
-# For production you will set MD_PROMPT as a secret in Render/Heroku
 MD_PROMPT = _load_text_from_env_or_file(
     env_name="MD_PROMPT",
     file_env_name="MD_PROMPT_FILE",
