@@ -9,9 +9,8 @@ from pdf_parser import extract_pdf_text_with_fallbacks
 from prompts import build_system_prompt
 from response_parser import (
     extract_json_from_text,
-    structured_json_to_markdown,
-    normalize_markdown,
     sanitize_raw_text,
+    convert_structured_or_fix,  # new helper that converts structured JSON or repairs raw markdown
 )
 from mode_handlers import MODE_HANDLERS
 from session_store import load_session, save_session, delete_session
@@ -71,78 +70,62 @@ async def chat(
     if not handler:
         raise HTTPException(status_code=400, detail=f"Unsupported mode: {mode}")
 
-    # Load session if provided and ensure it's for this mode
     session = None
     if session_id:
         session = load_session(session_id)
-        if session and session.get("mode") != mode:
-            # mismatch: ignore session to avoid cross-mode pollution
-            logger.info(f"Session {session_id} present but mode mismatch (expected {mode}). Ignoring session.")
-            session = None
+    
+    # Always create a session if one doesn't exist for this conversation
+    if not session:
+        session = {
+            "session_id": str(uuid.uuid4()),
+            "mode": mode,
+            "state": {"answers": {}}
+        }
+        logger.info(f"Created new session: {session['session_id']}")
 
-    # Parse answers if provided
-    answers_obj = None
     if answers:
         try:
             answers_obj = json.loads(answers)
+            session.setdefault("state", {}).setdefault("answers", {}).update(answers_obj)
+            logger.info(f"Updated session with answers: {answers_obj}")
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid 'answers' JSON format.")
 
-    # CRITICAL: For session-based handlers, always check for clarification first
+    # The core logic is now here. The handler's "brain" makes the decision.
     if handler.requires_session():
-        # Check if we need clarifying questions (this is the key enforcement point)
-        clar_qs = await handler.needs_clarification(session=session, incoming_messages=message_list, api_key=api_key)
+        clar_qs = await handler.needs_clarification(
+            session=session,
+            incoming_messages=message_list,
+            api_key=api_key
+        )
         
-        if clar_qs:
-            # We need clarifying questions - ensure session exists
-            if not session:
-                session = {
-                    "session_id": session_id or str(uuid.uuid4()),
-                    "mode": mode,
-                    "state": {"answers": {}}
-                }
-            
-            # If user provided answers, merge them into session
-            if answers_obj:
-                session.setdefault("state", {}).setdefault("answers", {}).update(answers_obj)
-                save_session(session)
-                
-                # Re-check if we still need more clarification after these answers
-                clar_qs_recheck = await handler.needs_clarification(session=session, incoming_messages=message_list, api_key=api_key)
-                if clar_qs_recheck:
-                    # Still need more questions
-                    return {
-                        "reply": "Thank you for your answers. Please answer these additional questions to help me provide better guidance.",
-                        "clarifying_questions": clar_qs_recheck,
-                        "session_id": session["session_id"]
-                    }
-                # else: we have enough answers, continue to planning below
-            else:
-                # First time asking questions
-                session.setdefault("state", {}).setdefault("pending_questions", [q["id"] for q in clar_qs])
-                save_session(session)
-                
-                return {
-                    "reply": "To provide you with the most effective career guidance, I need to understand your specific situation better. Please answer these questions:",
-                    "clarifying_questions": clar_qs,
-                    "session_id": session["session_id"]
-                }
+        # Save the session state after the handler has potentially modified it
+        save_session(session)
 
-    # If we reach here, either:
-    # 1. Handler doesn't require session (resume_review, etc.)
-    # 2. Handler requires session but we have sufficient answers to proceed
+        if clar_qs:
+            # The LLM decided to ask questions.
+            intro_message = "To provide the best guidance, I have a few questions for you:"
+            if answers: # This means it's a follow-up
+                intro_message = "Thanks for the information. I have a few more follow-up questions to ensure I understand correctly:"
+
+            return {
+                "reply": intro_message,
+                "clarifying_questions": clar_qs,
+                "session_id": session["session_id"]
+            }
+
+    # If clar_qs is None, the LLM decided to create a plan.
+    logger.info("Proceeding to generate career plan.")
     
-    # Build system prompt and messages
     system_prompt = build_system_prompt(mode)
     full_messages = [{"role": "system", "content": system_prompt}]
 
-    # Ask handler for extra system messages (includes collected answers for career advice)
-    extra_system_messages = handler.prepare_system_messages(session=session, incoming_messages=message_list, answers=answers_obj)
-    for m in extra_system_messages:
-        full_messages.append({"role": "system", "content": m})
+    extra_system_messages = handler.prepare_system_messages(session=session, incoming_messages=message_list, answers=None)
+    full_messages.extend([{"role": "system", "content": m} for m in extra_system_messages])
 
-    # Add conversation messages
-    full_messages += message_list
+    # Add only the most recent user message to avoid cluttering the final prompt
+    full_messages.append(message_list[-1])
+
 
     # Debug print (truncate long)
     print("--- MESSAGES SENT TO OPENAI API ---")
@@ -180,24 +163,25 @@ async def chat(
         # Delegate to handler to decide persistence and returned payload
         result = handler.handle_llm_response(session=session, structured=structured, raw_text=reply_text)
 
-        # Convert structured JSON to markdown unless handler preserves JSON
+        # If the handler wants to preserve JSON (raw), return a fenced JSON block (preferred by your prompt).
         preserve_json = bool(result.get("preserve_json", False))
 
-        if structured and not preserve_json:
+        if preserve_json and structured:
+            # Return a single fenced JSON block as required by your prompt rules
             try:
-                md_from_struct = structured_json_to_markdown(structured)
-                if md_from_struct and len(md_from_struct.strip()) > 5:
-                    reply_md = md_from_struct
-                else:
-                    reply_md = normalize_markdown(reply_text)
+                fenced = "```json\n" + json.dumps(structured, ensure_ascii=False, indent=2) + "\n```"
+                reply_md = fenced
             except Exception:
-                reply_md = normalize_markdown(reply_text)
+                # fallback to repair/conversion
+                reply_md = convert_structured_or_fix(reply_text, structured)
         else:
-            reply_candidate = result.get("reply")
-            if reply_candidate:
-                reply_md = reply_candidate
-            else:
-                reply_md = normalize_markdown(reply_text)
+            # Convert structured JSON to beautiful markdown OR repair raw markdown
+            # convert_structured_or_fix handles both structured JSON and raw markdown repair
+            reply_md = convert_structured_or_fix(reply_text, structured)
+
+        # Debug logs for troubleshooting formatting issues (optional)
+        logger.debug(f"Structured extracted: {json.dumps(structured) if structured else 'None'}")
+        logger.debug(f"Final reply_md (first 800 chars): {reply_md[:800]}")
 
         # Prepare return payload
         return_payload = {"reply": reply_md}
