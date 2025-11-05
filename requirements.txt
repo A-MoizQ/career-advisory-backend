@@ -1,0 +1,11 @@
+fastapi
+httpx
+langchain-core
+langchain-openai
+langchain-community
+langgraph
+pymupdf4llm
+PyMuPDF
+pdfplumber
+redis
+uvicorn

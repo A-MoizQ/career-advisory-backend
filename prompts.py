@@ -9,21 +9,33 @@ try:
 except Exception:
     pass
 
-# --- Simple fallback markdown guide (shorter, less strict) ---
-DEFAULT_MARKDOWN_GUIDE_SIMPLE = """
-Format the assistant's reply as GitHub-Flavored Markdown (GFM).
-- Use headings (## or ###) to separate sections.
-- Use bullet lists or numbered lists for actionable items.
-- Use pipe-style tables for tabular data; include a header row and a separator row (---).
-- Keep table columns consistent; prefer short cell text.
-- Do not output HTML or decorative box characters.
-- If possible, return a single JSON block with keys `title`, `sections`, and `tables` (only if JSON fully represents the content).
-""".strip()
+# ---------------------------------------------------------------------------
+# PROMPT ARCHITECTURE NOTES:
+# ---------------------------------------------------------------------------
+# - career_advice mode: Uses LangGraph with prompts embedded in graph nodes
+#   (see orchestration/career_graph.py). MD_PROMPT and CAREER_PROMPT are NOT used.
+#
+# - Other modes (resume_review, job_hunt, etc.): Use legacy _NoOpHandler which
+#   calls build_system_prompt() below. These modes are NOT yet migrated to LangGraph.
+#
+# When migrating modes to LangGraph, move their prompts into the graph nodes
+# and remove them from DEFAULT_MODE_PROMPTS.
+# ---------------------------------------------------------------------------
+
 
 def _load_text_from_env_or_file(env_name: str,
                                 file_env_name: str = None,
                                 b64_env_name: str = None,
                                 default: str = "") -> str:
+    """
+    Load prompt from environment variable, file, or base64-encoded env var.
+    
+    Priority order:
+    1. Raw env var (env_name)
+    2. Base64-encoded env var (b64_env_name)
+    3. File path from env var (file_env_name)
+    4. Default value
+    """
     # 1) Raw env var (works if you ensured exact newlines were preserved)
     v = os.environ.get(env_name)
     if v:
@@ -51,37 +63,73 @@ def _load_text_from_env_or_file(env_name: str,
     # fallback
     return default
 
-# Load main markdown prompt from env, fallback to the simple default
-MD_PROMPT = _load_text_from_env_or_file(
-    env_name="MD_PROMPT",
-    file_env_name="MD_PROMPT_FILE",
-    b64_env_name="MD_PROMPT_B64",
-    default=DEFAULT_MARKDOWN_GUIDE_SIMPLE
-)
 
-# --- MODE prompts: prefer environment overrides per-mode ---
+# ---------------------------------------------------------------------------
+# Legacy mode prompts (for modes NOT yet migrated to LangGraph)
+# ---------------------------------------------------------------------------
+
 DEFAULT_MODE_PROMPTS: Dict[str, str] = {
-    "career_advice": "You're a helpful AI career advisor.",
+    # NOTE: career_advice prompt is NOT used - see orchestration/career_graph.py
     "resume_review": "You are an expert resume reviewer. Analyze the provided resume text, identify its structure and provide actionable feedback.",
     "job_hunt": "You suggest job hunting strategies and tips.",
     "learning_roadmap": "You recommend learning paths based on goals.",
     "mock_interview": "You act as a mock interviewer and give feedback."
 }
 
+# Simple markdown formatting guide for legacy modes
+DEFAULT_MARKDOWN_GUIDE = """
+Format the assistant's reply as GitHub-Flavored Markdown (GFM).
+- Use headings (## or ###) to separate sections.
+- Use bullet lists or numbered lists for actionable items.
+- Use pipe-style tables for tabular data; include a header row and a separator row (---).
+- Keep table columns consistent; prefer short cell text.
+- Do not output HTML or decorative box characters.
+""".strip()
 
 MODE_PROMPTS: Dict[str, str] = {
-    "career_advice": _load_text_from_env_or_file(env_name="CAREER_PROMPT",file_env_name="CAREER_PROMPT_FILE",b64_env_name="CAREER_PROMPT_B64", default=DEFAULT_MODE_PROMPTS["career_advice"]),
-    "resume_review": _load_text_from_env_or_file(env_name="RESUME_REVIEW_PROMPT",file_env_name="RESUME_REVIEW_PROMPT_FILE",b64_env_name="RESUME_REVIEW_PROMPT_B64", default=DEFAULT_MODE_PROMPTS["resume_review"]),
-    "job_hunt": _load_text_from_env_or_file(env_name="JOB_HUNT_PROMPT",file_env_name="JOB_HUNT_PROMPT_FILE",b64_env_name="JOB_HUNT_PROMPT_B64", default=DEFAULT_MODE_PROMPTS["job_hunt"]),
-    "learning_roadmap": _load_text_from_env_or_file(env_name="LEARNING_ROADMAP_PROMPT",file_env_name="LEARNING_ROADMAP_PROMPT_FILE",b64_env_name="LEARNING_ROADMAP_PROMPT_B64", default=DEFAULT_MODE_PROMPTS["learning_roadmap"]),
-    "mock_interview": _load_text_from_env_or_file(env_name="MOCK_INTERVIEW_PROMPT",file_env_name="MOCK_INTERVIEW_PROMPT_FILE",b64_env_name="MOCK_INTERVIEW_PROMPT_B64", default=DEFAULT_MODE_PROMPTS["mock_interview"]),
+    "resume_review": _load_text_from_env_or_file(
+        env_name="RESUME_REVIEW_PROMPT",
+        file_env_name="RESUME_REVIEW_PROMPT_FILE",
+        b64_env_name="RESUME_REVIEW_PROMPT_B64",
+        default=DEFAULT_MODE_PROMPTS["resume_review"]
+    ),
+    "job_hunt": _load_text_from_env_or_file(
+        env_name="JOB_HUNT_PROMPT",
+        file_env_name="JOB_HUNT_PROMPT_FILE",
+        b64_env_name="JOB_HUNT_PROMPT_B64",
+        default=DEFAULT_MODE_PROMPTS["job_hunt"]
+    ),
+    "learning_roadmap": _load_text_from_env_or_file(
+        env_name="LEARNING_ROADMAP_PROMPT",
+        file_env_name="LEARNING_ROADMAP_PROMPT_FILE",
+        b64_env_name="LEARNING_ROADMAP_PROMPT_B64",
+        default=DEFAULT_MODE_PROMPTS["learning_roadmap"]
+    ),
+    "mock_interview": _load_text_from_env_or_file(
+        env_name="MOCK_INTERVIEW_PROMPT",
+        file_env_name="MOCK_INTERVIEW_PROMPT_FILE",
+        b64_env_name="MOCK_INTERVIEW_PROMPT_B64",
+        default=DEFAULT_MODE_PROMPTS["mock_interview"]
+    ),
 }
 
-# Export safe helper to build final system prompt
+MD_PROMPT = _load_text_from_env_or_file(
+    env_name="MD_PROMPT",
+    file_env_name="MD_PROMPT_FILE",
+    b64_env_name="MD_PROMPT_B64",
+    default=DEFAULT_MARKDOWN_GUIDE
+)
+
+
 def build_system_prompt(mode: str) -> str:
     """
-    Compose the system prompt for the model.
-    Avoid printing/logging MD_PROMPT or MODE_PROMPTS (secrets).
+    Build system prompt for LEGACY modes only (resume_review, job_hunt, etc.).
+    
+    NOTE: career_advice mode does NOT use this function - it uses LangGraph
+    with prompts embedded in orchestration/career_graph.py nodes.
+    
+    Returns:
+        Combined mode-specific prompt + markdown formatting guidelines.
     """
-    mode_prompt = MODE_PROMPTS.get(mode, DEFAULT_MODE_PROMPTS["career_advice"])
+    mode_prompt = MODE_PROMPTS.get(mode, DEFAULT_MODE_PROMPTS.get("resume_review", ""))
     return mode_prompt + "\n\n" + MD_PROMPT
